@@ -447,72 +447,88 @@ func (l *Loop) handleMaxTokensTruncation(ctx context.Context, resp *llm.Response
 
 // executeToolCalls runs the tools from an LLM response and appends the results
 // to l.history. It does NOT call processLLMRequest — the caller loops instead.
+//
+// All tool calls within a single LLM response are executed concurrently.
+// The LLM chose to issue them all in the same turn, so they are independent.
+// Results are collected in the original order (matching tool_use IDs).
 func (l *Loop) executeToolCalls(ctx context.Context, content []llm.Content) error {
-	var toolResults []llm.Content
-
+	// Collect the tool-use blocks.
+	type toolCall struct {
+		content llm.Content   // the tool_use content block
+		tool    *llm.Tool     // resolved tool (nil = not found)
+	}
+	var calls []toolCall
 	for _, c := range content {
 		if c.Type != llm.ContentTypeToolUse {
 			continue
 		}
-
-		l.logger.Debug("executing tool", "name", c.ToolName, "id", c.ID)
-
-		// Find the tool
-		var tool *llm.Tool
+		var found *llm.Tool
 		for _, t := range l.tools {
 			if t.Name == c.ToolName {
-				tool = t
+				found = t
 				break
 			}
 		}
+		calls = append(calls, toolCall{content: c, tool: found})
+	}
 
-		if tool == nil {
-			l.logger.Error("tool not found", "name", c.ToolName)
-			toolResults = append(toolResults, llm.Content{
+	// Run all tools concurrently and collect results in order.
+	toolResults := make([]llm.Content, len(calls))
+	var wg sync.WaitGroup
+	for i, tc := range calls {
+		if tc.tool == nil {
+			l.logger.Error("tool not found", "name", tc.content.ToolName)
+			toolResults[i] = llm.Content{
 				Type:      llm.ContentTypeToolResult,
-				ToolUseID: c.ID,
+				ToolUseID: tc.content.ID,
 				ToolError: true,
 				ToolResult: []llm.Content{
-					{Type: llm.ContentTypeText, Text: fmt.Sprintf("Tool '%s' not found", c.ToolName)},
+					{Type: llm.ContentTypeText, Text: fmt.Sprintf("Tool '%s' not found", tc.content.ToolName)},
 				},
-			})
+			}
 			continue
 		}
 
-		// Execute the tool with working directory and progress callback set in context
-		toolCtx := ctx
-		if l.workingDir != "" {
-			toolCtx = claudetool.WithWorkingDir(ctx, l.workingDir)
-		}
-		if l.onToolProgress != nil {
-			toolCtx = claudetool.WithToolProgress(toolCtx, l.onToolProgress)
-		}
-		toolCtx = claudetool.WithToolUseID(toolCtx, c.ID)
-		startTime := time.Now()
-		result := tool.Run(toolCtx, c.ToolInput)
-		endTime := time.Now()
+		wg.Add(1)
+		go func(idx int, c llm.Content, tool *llm.Tool) {
+			defer wg.Done()
+			l.logger.Debug("executing tool", "name", c.ToolName, "id", c.ID)
 
-		var toolResultContent []llm.Content
-		if result.Error != nil {
-			l.logger.Error("tool execution failed", "name", c.ToolName, "error", result.Error)
-			toolResultContent = []llm.Content{
-				{Type: llm.ContentTypeText, Text: result.Error.Error()},
+			toolCtx := ctx
+			if l.workingDir != "" {
+				toolCtx = claudetool.WithWorkingDir(ctx, l.workingDir)
 			}
-		} else {
-			toolResultContent = result.LLMContent
-			l.logger.Debug("tool executed successfully", "name", c.ToolName, "duration", endTime.Sub(startTime))
-		}
+			if l.onToolProgress != nil {
+				toolCtx = claudetool.WithToolProgress(toolCtx, l.onToolProgress)
+			}
+			toolCtx = claudetool.WithToolUseID(toolCtx, c.ID)
+			startTime := time.Now()
+			result := tool.Run(toolCtx, c.ToolInput)
+			endTime := time.Now()
 
-		toolResults = append(toolResults, llm.Content{
-			Type:             llm.ContentTypeToolResult,
-			ToolUseID:        c.ID,
-			ToolError:        result.Error != nil,
-			ToolResult:       toolResultContent,
-			ToolUseStartTime: &startTime,
-			ToolUseEndTime:   &endTime,
-			Display:          result.Display,
-		})
+			var toolResultContent []llm.Content
+			if result.Error != nil {
+				l.logger.Error("tool execution failed", "name", c.ToolName, "error", result.Error)
+				toolResultContent = []llm.Content{
+					{Type: llm.ContentTypeText, Text: result.Error.Error()},
+				}
+			} else {
+				toolResultContent = result.LLMContent
+				l.logger.Debug("tool executed successfully", "name", c.ToolName, "duration", endTime.Sub(startTime))
+			}
+
+			toolResults[idx] = llm.Content{
+				Type:             llm.ContentTypeToolResult,
+				ToolUseID:        c.ID,
+				ToolError:        result.Error != nil,
+				ToolResult:       toolResultContent,
+				ToolUseStartTime: &startTime,
+				ToolUseEndTime:   &endTime,
+				Display:          result.Display,
+			}
+		}(i, tc.content, tc.tool)
 	}
+	wg.Wait()
 
 	if len(toolResults) > 0 {
 		// Add tool results to history as a user message

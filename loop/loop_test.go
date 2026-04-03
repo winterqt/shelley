@@ -2136,3 +2136,74 @@ func TestMaxTokensTruncation(t *testing.T) {
 //		t.Error("expected to find tool2 result in message 3")
 //	}
 //}
+
+func TestExecuteToolCallsConcurrently(t *testing.T) {
+	// Two tools that each block on a channel. If executed sequentially,
+	// the test will deadlock/timeout because tool1 waits for tool2 to
+	// start before returning, and tool2 can't start until tool1 finishes.
+	tool1Started := make(chan struct{})
+	tool2Started := make(chan struct{})
+
+	tool1 := &llm.Tool{
+		Name:        "tool1",
+		Description: "test tool 1",
+		InputSchema: llm.MustSchema(`{"type":"object","properties":{}}`),
+		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
+			close(tool1Started)
+			// Wait for tool2 to also be running — proves concurrency.
+			<-tool2Started
+			return llm.ToolOut{LLMContent: llm.TextContent("result1")}
+		},
+	}
+
+	tool2 := &llm.Tool{
+		Name:        "tool2",
+		Description: "test tool 2",
+		InputSchema: llm.MustSchema(`{"type":"object","properties":{}}`),
+		Run: func(ctx context.Context, input json.RawMessage) llm.ToolOut {
+			close(tool2Started)
+			// Wait for tool1 to also be running — proves concurrency.
+			<-tool1Started
+			return llm.ToolOut{LLMContent: llm.TextContent("result2")}
+		},
+	}
+
+	var recordedMessages []llm.Message
+	loop := NewLoop(Config{
+		LLM:     NewPredictableService(),
+		History: []llm.Message{},
+		Tools:   []*llm.Tool{tool1, tool2},
+		RecordMessage: func(ctx context.Context, msg llm.Message, usage llm.Usage) error {
+			recordedMessages = append(recordedMessages, msg)
+			return nil
+		},
+	})
+
+	content := []llm.Content{
+		{ID: "id1", Type: llm.ContentTypeToolUse, ToolName: "tool1", ToolInput: json.RawMessage(`{}`)},
+		{ID: "id2", Type: llm.ContentTypeToolUse, ToolName: "tool2", ToolInput: json.RawMessage(`{}`)},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := loop.executeToolCalls(ctx, content)
+	if err != nil {
+		t.Fatalf("executeToolCalls failed: %v", err)
+	}
+
+	// Results should be recorded in order.
+	if len(recordedMessages) != 1 {
+		t.Fatalf("expected 1 recorded message, got %d", len(recordedMessages))
+	}
+	msg := recordedMessages[0]
+	if len(msg.Content) != 2 {
+		t.Fatalf("expected 2 tool results, got %d", len(msg.Content))
+	}
+	if msg.Content[0].ToolUseID != "id1" {
+		t.Errorf("expected first result for id1, got %s", msg.Content[0].ToolUseID)
+	}
+	if msg.Content[1].ToolUseID != "id2" {
+		t.Errorf("expected second result for id2, got %s", msg.Content[1].ToolUseID)
+	}
+}
